@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+requests
+beautifulsoup4
+langchain<0.2
+langchain-community<0.2
+langchain-chroma
+edge-tts
+python-dotenv
