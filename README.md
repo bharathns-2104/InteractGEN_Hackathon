@@ -6,7 +6,7 @@
 - Activate Python venv and run backend server:
   - Windows PowerShell:
     - `& ./venv/Scripts/Activate.ps1`
-    - `python .\backend\server.py`
+    - `python .\backend\server2.py`
 
 ## Troubleshooting
 
