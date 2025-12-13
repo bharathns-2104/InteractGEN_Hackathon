@@ -1,12 +1,15 @@
 # FILE: backend/server.py
 import os
 import logging
+# Suppress python-dotenv parse warnings when .env has non-KEY=VALUE lines
+logging.getLogger("dotenv").setLevel(logging.ERROR)
 from dotenv import load_dotenv
 load_dotenv()
 import uvicorn
 import requests
 import asyncio
 from fastapi import FastAPI, HTTPException
+from requests.exceptions import RequestException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -42,6 +45,8 @@ app.add_middleware(
 PERSIST_DIRECTORY = "./notebook_db"
 # CONFIG: Model Name
 MODEL_NAME = "llama3"
+# CONFIG: Ollama URL (can be overridden with env var OLLAMA_HOST)
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 
 # GLOBAL STATE
 DB = {"vectorstore": None}
@@ -56,6 +61,28 @@ def get_vectorstore():
             embedding_function=embeddings
         )
     return DB["vectorstore"]
+
+
+def ollama_is_ready(timeout: float = 1.0) -> bool:
+    """Quick health check for local Ollama server."""
+    try:
+        resp = requests.get(f"{OLLAMA_HOST}/api/version", timeout=timeout)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+async def ensure_ollama_ready(retries: int = 6, base_delay: float = 1.0) -> None:
+    """Wait for Ollama to become available, raising HTTPException if not."""
+    delay = base_delay
+    for attempt in range(1, retries + 1):
+        if ollama_is_ready(timeout=1.0):
+            logger.info("Ollama is reachable.")
+            return
+        logger.warning(f"Ollama not reachable (attempt {attempt}/{retries}). Retrying in {delay}s...")
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 10)
+    raise HTTPException(status_code=503, detail=f"Ollama at {OLLAMA_HOST} is not available. Start Ollama (e.g. `ollama serve`) and retry.")
 
 # --- 1. CRAWLER V2 (Robust) ---
 def crawl_website(base_url, max_pages=1):
@@ -128,6 +155,7 @@ class DeleteSourceRequest(BaseModel):
 async def ingest(req: IngestRequest):
     # No API Key validation needed for Ollama
     try:
+        await ensure_ollama_ready()
         docs = crawl_website(req.url)
         if not docs: raise HTTPException(400, "No content found on this page (or blocked).")
         
@@ -138,7 +166,11 @@ async def ingest(req: IngestRequest):
         # Add to Persistent DB
         logger.info(f"⏳ Hitting Ollama to embed {len(splits)} chunks... this might take a while.")
         vectorstore = get_vectorstore()
-        vectorstore.add_documents(splits)
+        try:
+            vectorstore.add_documents(splits)
+        except RequestException as re:
+            logger.error(f"Ollama request failed during embed: {re}")
+            raise HTTPException(503, f"Ollama inference endpoint is not responding: {re}")
         logger.info(f"✅ Finished embedding! Added to DB.")
         
         return {"status": "success", "count": len(docs), "message": f"Added {len(docs)} pages to memory."}
@@ -150,6 +182,7 @@ async def ingest(req: IngestRequest):
 async def chat(req: ChatRequest):
     logger.info(f"Chat request: {req.question}")
     try:
+        await ensure_ollama_ready()
         vectorstore = get_vectorstore()
         # Use ChatOllama
         llm = ChatOllama(model=MODEL_NAME)
@@ -166,7 +199,11 @@ async def chat(req: ChatRequest):
         """)
         
         chain = create_retrieval_chain(vectorstore.as_retriever(), create_stuff_documents_chain(llm, prompt))
-        response = chain.invoke({"input": req.question})
+        try:
+            response = chain.invoke({"input": req.question})
+        except RequestException as re:
+            logger.error(f"Ollama request failed during chat: {re}")
+            raise HTTPException(503, f"Ollama inference endpoint is not responding: {re}")
         
         sources = set()
         for doc in response["context"]:
@@ -184,13 +221,18 @@ async def chat(req: ChatRequest):
 async def briefing(req: IngestRequest):
     """Generates the 'Source Guide' (Summary/FAQ)"""
     try:
+        await ensure_ollama_ready()
         retriever = get_vectorstore().as_retriever(search_kwargs={"k": 5})
         docs = retriever.invoke("Overview of the content")
         if not docs: return {"content": "No content available to summarize."}
         
         text = "\n".join([d.page_content for d in docs])
         llm = ChatOllama(model=MODEL_NAME)
-        summary = llm.invoke(f"Create a Briefing Doc (Summary, 3 Key Topics, 3 FAQ) for: {text[:10000]}").content
+        try:
+            summary = llm.invoke(f"Create a Briefing Doc (Summary, 3 Key Topics, 3 FAQ) for: {text[:10000]}").content
+        except RequestException as re:
+            logger.error(f"Ollama request failed during briefing: {re}")
+            raise HTTPException(503, f"Ollama inference endpoint is not responding: {re}")
         return {"content": summary}
     except Exception as e:
         logger.error(f"Briefing error: {e}")
@@ -199,6 +241,7 @@ async def briefing(req: IngestRequest):
 @app.get("/podcast")
 async def podcast():
     try:
+        await ensure_ollama_ready()
         vectorstore = get_vectorstore()
         docs = vectorstore.similarity_search("Main concepts overview", k=10)
         if not docs: raise HTTPException(400, "Not enough content for a podcast.")
@@ -206,7 +249,11 @@ async def podcast():
         context = "\n".join([d.page_content for d in docs])
         
         llm = ChatOllama(model=MODEL_NAME)
-        script = llm.invoke(f"Create a 1-minute 2-host podcast script about: {context[:10000]}").content
+        try:
+            script = llm.invoke(f"Create a 1-minute 2-host podcast script about: {context[:10000]}").content
+        except RequestException as re:
+            logger.error(f"Ollama request failed during podcast generation: {re}")
+            raise HTTPException(503, f"Ollama inference endpoint is not responding: {re}")
         
         full_audio = b""
         for line in script.split('\n'):
@@ -267,4 +314,5 @@ async def clear_db():
     return {"status": "cleared"}
 
 if __name__ == "__main__":
+    logger.info(f"Starting server; Ollama host: {OLLAMA_HOST}")
     uvicorn.run(app, host="127.0.0.1", port=8000)
